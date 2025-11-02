@@ -398,6 +398,20 @@ def load_products_file(path: Path) -> Dict[str, Any]:
     return data
 
 
+def coerce_product_id_value(pid: str) -> Any:
+    """Return JSON-friendly product.id value (prefer integers for digit-only IDs)."""
+
+    text = str(pid).strip()
+    if not text:
+        return text
+    if text.isdigit():
+        try:
+            return int(text)
+        except ValueError:  # pragma: no cover - defensive
+            return text
+    return text
+
+
 def ensure_products_file(
     path: Path,
     *,
@@ -453,12 +467,16 @@ def ensure_products_file(
             if is_active_raw not in (None, 0, 1):
                 changed = True
 
+        pid_value = coerce_product_id_value(pid)
         entry = {
-            "product.id": pid,
+            "product.id": pid_value,
             "product.name": name,
             "queries": queries,
             "is_active": is_active,
         }
+
+        if pid_value != pid_raw:
+            changed = True
 
         if name != str(name_raw).strip():
             changed = True
@@ -480,8 +498,9 @@ def ensure_products_file(
         name_clean = str(name).strip()
         entry = index.get(pid)
         if entry is None:
+            pid_value = coerce_product_id_value(pid)
             entry = {
-                "product.id": pid,
+                "product.id": pid_value,
                 "product.name": name_clean,
                 "queries": [],
                 "is_active": True,
