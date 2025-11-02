@@ -528,8 +528,18 @@ def resolve_ui_price(prod: Dict[str, Any]) -> Optional[int]:
 
 
 def extract_item(prod: Dict[str, Any]) -> Dict[str, Any]:
+    def resolve_id() -> Optional[str]:
+        for key in ("id", "nmId", "nmid", "productId", "nm"):
+            raw = prod.get(key)
+            if raw is None:
+                continue
+            text = str(raw).strip()
+            if text:
+                return text
+        return None
+
     return {
-        "id": prod.get("id"),
+        "id": resolve_id(),
         "brand": prod.get("brand"),
         "name": prod.get("name"),
         "price_product": resolve_ui_price(prod),
@@ -626,18 +636,40 @@ def build_params(
     return remove_none(params)
 
 
+def parse_retry_after(headers: Any) -> float:
+    if not isinstance(headers, dict):
+        return 0.0
+    value = headers.get("Retry-After")
+    if value is None:
+        return 0.0
+    try:
+        delay = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return delay if delay > 0 else 0.0
+
+
 def attempt_with_client(client: Any, url: str, params: Dict[str, str], headers: Dict[str, str], timeout: float) -> Optional[Dict[str, Any]]:
     t0 = time.perf_counter()
     resp = client.get(url, params=params, headers=headers, timeout=timeout)
     elapsed = time.perf_counter() - t0
     logger.debug("GET %s", getattr(resp, "url", url))
+    status_code = getattr(resp, "status_code", "?")
     logger.info(
         " status=%s | %.3fs | bytes=%s",
-        getattr(resp, "status_code", "?"),
+        status_code,
         elapsed,
         len(getattr(resp, "content", b"")),
     )
     debug_log_full_response(resp, url)
+
+    if status_code == 429:
+        retry_delay = parse_retry_after(getattr(resp, "headers", {}))
+        if retry_delay <= 0:
+            retry_delay = max(RETRY_JITTER, 1.0)
+        logger.warning("WB вернул 429 Too Many Requests. Пауза %.2fs перед повтором.", retry_delay)
+        time.sleep(retry_delay)
+        return None
 
     if hasattr(resp, "raise_for_status"):
         with suppress(Exception):
