@@ -693,10 +693,10 @@ def fetch_page_best_effort(
     debug_dump_dir: Optional[Path],
     cookie_file: Optional[str],
     allow_flat_fallback: bool,
-) -> Tuple[List[Dict[str, Any]], str, Dict[str, Optional[str]]]:
+) -> Tuple[List[Dict[str, Any]], str, Dict[str, Optional[str]], List[Dict[str, Any]]]:
     """
     Try multiple client profiles to avoid the preset structure.
-    Returns: (items, mode, override)
+    Returns: (items, mode, override, raw_products)
       - items: list of extracted items
       - mode: {"ok", "fallback", "bad"}
       - override: server hints like dest/spp if present
@@ -790,7 +790,8 @@ def fetch_page_best_effort(
 
             # Normal structure — parse UI-like prices
             items = [extract_item(p) for p in products_raw]
-            return items, "ok", override
+            raw_list = [p for p in products_raw if isinstance(p, dict)]
+            return items, "ok", override, raw_list
 
         except requests.HTTPError as e:  # pragma: no cover - network branch
             code = e.response.status_code if getattr(e, "response", None) is not None else "?"
@@ -808,11 +809,12 @@ def fetch_page_best_effort(
     if allow_flat_fallback and isinstance(last_payload, dict):
         flat_list, _ = choose_products_list(last_payload)
         items = [extract_item(p) for p in flat_list]
+        raw_list = [p for p in flat_list if isinstance(p, dict)]
         logger.warning("Все профили дали preset (%s). Применён fallback по flat-ценам.", last_bad_reason or "no-reason")
-        return items, "fallback", last_override
+        return items, "fallback", last_override, raw_list
 
     logger.warning("Все профили дали preset. Fallback отключён — помечаем как Bad response.")
-    return [], "bad", last_override
+    return [], "bad", last_override, []
 
 
 # ============================
