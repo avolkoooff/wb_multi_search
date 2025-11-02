@@ -665,11 +665,8 @@ def attempt_with_client(client: Any, url: str, params: Dict[str, str], headers: 
 
     if status_code == 429:
         retry_delay = parse_retry_after(getattr(resp, "headers", {}))
-        random_delay = random.uniform(1.0, 5.0)
         if retry_delay <= 0:
-            retry_delay = random_delay
-        else:
-            retry_delay = max(retry_delay, random_delay)
+            retry_delay = max(RETRY_JITTER, 1.0)
         logger.warning("WB вернул 429 Too Many Requests. Пауза %.2fs перед повтором.", retry_delay)
         time.sleep(retry_delay)
         return None
@@ -925,7 +922,7 @@ def fetch_reference_price(
     if not query:
         return None, {}, "bad_id"
 
-    items, mode, override, raw_products = fetch_page_best_effort(
+    items, mode, override = fetch_page_best_effort(
         query=query,
         page=1,
         limit=limit,
@@ -937,37 +934,19 @@ def fetch_reference_price(
     )
 
     price: Optional[int] = None
-    # Try exact match on raw payload to avoid transformation issues.
-    for prod in raw_products:
-        if not isinstance(prod, dict):
-            continue
-        pid = prod.get("id")
+    for it in items:
+        pid = it.get("id")
         if pid is None:
             continue
         if str(pid) != query:
             continue
-        val = resolve_ui_price(prod)
+        val = it.get("price_product")
         if isinstance(val, (int, float)):
             try:
                 price = int(val)
             except Exception:
                 price = None
         break
-
-    if price is None:
-        for it in items:
-            pid = it.get("id")
-            if pid is None:
-                continue
-            if str(pid) != query:
-                continue
-            val = it.get("price_product")
-            if isinstance(val, (int, float)):
-                try:
-                    price = int(val)
-                except Exception:
-                    price = None
-            break
 
     if price is None:
         if mode == "bad":
@@ -1122,7 +1101,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             query_status: str = "ok"
 
             for page in range(1, args.pages + 1):
-                items, mode, override, _ = fetch_page_best_effort(
+                items, mode, override = fetch_page_best_effort(
                     query=q,
                     page=page,
                     limit=args.limit,
