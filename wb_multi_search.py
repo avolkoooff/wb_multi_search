@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Wildberries multi-search → CSV (refactored + brand-based price filtering)
+Wildberries multi-search → CSV (brand catalog-driven + price filtering)
 
-Additions in this update:
-- Script-embedded filtering parameters (no external file):
-  * key_brand (default: "Regner Coin")
-  * price_diff_pct (default: 25.0)
-- CLI overrides are supported: --key-brand, --price-diff-pct
-- If multiple products of key_brand exist, the *minimum* price is used as the reference.
-- Products whose price differs by more than price_diff_pct from the reference are removed.
-- Original order from WB is strictly preserved during filtering.
+Главные изменения:
+- Стартовый список товаров формируется автоматически из бренда Wildberries.
+- Список и параметры запросов хранятся во внешнем файле products.json.
+- Фильтрация по цене использует опорную цену конкретного товара (по его ID).
+- Пользователь редактирует только поле queries и флаг is_active в products.json.
 
 Python 3.9+
 """
@@ -45,6 +42,24 @@ except Exception:  # pragma: no cover - optional dependency
 # Constants & configuration
 # ============================
 BASE_URL = "https://u-search.wb.ru/exactmatch/ru/common/v18/search"
+BRAND_URL = "https://catalog.wb.ru/brands/v4/catalog"
+
+BRAND_ID = "312150357"
+DEFAULT_BRAND_PARAMS: Dict[str, str] = {
+    "ab_testing": "false",
+    "appType": "1",
+    "brand": BRAND_ID,
+    "curr": "rub",
+    "dest": "-428431",
+    "hide_dtype": "11",
+    "lang": "ru",
+    "page": "1",
+    "sort": "popular",
+    "spp": "30",
+    "uclusters": "2",
+}
+
+DEFAULT_PRODUCTS_FILE = "products.json"
 
 DEFAULT_PARAMS: Dict[str, str] = {
     "ab_testing": "false",
@@ -87,7 +102,6 @@ logger = logging.getLogger("wb_multi_search")
 
 @dataclass
 class FilterConfig:
-    key_brand: str = "Regner Coin"
     price_diff_pct: float = 25.0  # percent, e.g. 25.0 → ±25%
 
 
@@ -194,13 +208,22 @@ def make_httpx_client(cookie_file: Optional[str] = None, http2: bool = True):
     return httpx.Client(http2=http2, cookies=cookies, timeout=None, trust_env=False)
 
 
-def parse_queries(s: str) -> List[str]:
-    """Split queries by ';' and strip empties."""
-    return [q.strip() for q in s.split(";") if q.strip()]
-
-
 def remove_none(d: Dict[str, Optional[str]]) -> Dict[str, str]:
     return {k: v for k, v in d.items() if v is not None}
+
+
+def sanitize_query_list(value: Any) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    sanitized: List[str] = []
+    for item in value:
+        if isinstance(item, str):
+            candidate = item.strip()
+        else:
+            candidate = str(item).strip()
+        if candidate:
+            sanitized.append(candidate)
+    return sanitized
 
 
 # ============================
@@ -299,6 +322,192 @@ def choose_products_list(payload: Any) -> Tuple[List[Dict[str, Any]], str]:
     return chosen, chosen_path
 
 
+def fetch_brand_catalog_products(
+    *,
+    session: Optional[requests.Session] = None,
+    params: Optional[Dict[str, str]] = None,
+    timeout: float = 12.0,
+) -> Dict[str, str]:
+    """Fetch brand catalog and return mapping product.id → product.name."""
+
+    query_params = dict(DEFAULT_BRAND_PARAMS)
+    if params:
+        query_params.update(params)
+
+    own_session = False
+    sess = session
+    if sess is None:
+        sess = make_requests_session()
+        own_session = True
+
+    try:
+        resp = sess.get(BRAND_URL, params=query_params, headers=make_headers(), timeout=timeout)
+        logger.info("GET %s", getattr(resp, "url", BRAND_URL))
+        resp.raise_for_status()
+        try:
+            payload = resp.json()
+        except Exception as exc:  # pragma: no cover - defensive branch
+            logger.error("Ответ каталога бренда не JSON: %s", exc)
+            raise
+
+        products_raw, path = choose_products_list(payload)
+        mapping: Dict[str, str] = {}
+        for prod in products_raw:
+            if not isinstance(prod, dict):
+                continue
+            pid = prod.get("id")
+            name = prod.get("name")
+            if pid is None or name is None:
+                continue
+            pid_str = str(pid).strip()
+            if not pid_str:
+                continue
+            mapping[pid_str] = str(name).strip()
+
+        logger.info(
+            "Каталог бренда: найдено %s товаров (path=%s)",
+            len(mapping),
+            path,
+        )
+        return mapping
+    finally:
+        if own_session and sess is not None:
+            with suppress(Exception):
+                sess.close()
+
+
+def load_products_file(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {"products": []}
+
+    try:
+        text = path.read_text(encoding="utf-8")
+        data = json.loads(text)
+    except Exception as exc:  # pragma: no cover - IO branch
+        logger.warning("Не удалось прочитать '%s': %s. Будет создан новый файл.", path, exc)
+        return {"products": []}
+
+    if not isinstance(data, dict):
+        logger.warning("Некорректная структура в '%s'. Будет создан новый файл.", path)
+        return {"products": []}
+
+    products = data.get("products")
+    if not isinstance(products, list):
+        data["products"] = []
+
+    return data
+
+
+def ensure_products_file(
+    path: Path,
+    *,
+    session: Optional[requests.Session] = None,
+    params: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Ensure products.json exists and is up-to-date with the brand catalog."""
+
+    brand_products = fetch_brand_catalog_products(session=session, params=params)
+    data = load_products_file(path)
+
+    existing_raw = data.get("products")
+    if not isinstance(existing_raw, list):
+        existing_raw = []
+
+    cleaned: List[Dict[str, Any]] = []
+    index: Dict[str, Dict[str, Any]] = {}
+    changed = not path.exists()
+
+    for item in existing_raw:
+        if not isinstance(item, dict):
+            changed = True
+            continue
+        pid_raw = item.get("product.id") or item.get("id")
+        if pid_raw is None:
+            changed = True
+            continue
+        pid = str(pid_raw).strip()
+        if not pid:
+            changed = True
+            continue
+
+        name_raw = item.get("product.name") or item.get("name") or ""
+        name = str(name_raw).strip()
+
+        queries_raw = item.get("queries")
+        queries = sanitize_query_list(queries_raw)
+
+        is_active_raw = item.get("is_active", True)
+        if isinstance(is_active_raw, bool):
+            is_active = is_active_raw
+        elif isinstance(is_active_raw, str):
+            norm = is_active_raw.strip().lower()
+            if norm in {"false", "0", "no", "off"}:
+                is_active = False
+            elif norm in {"true", "1", "yes", "on"}:
+                is_active = True
+            else:
+                is_active = bool(norm)
+            changed = True
+        else:
+            is_active = bool(is_active_raw)
+            if is_active_raw not in (None, 0, 1):
+                changed = True
+
+        entry = {
+            "product.id": pid,
+            "product.name": name,
+            "queries": queries,
+            "is_active": is_active,
+        }
+
+        if name != str(name_raw).strip():
+            changed = True
+
+        if isinstance(queries_raw, list):
+            if queries != queries_raw:
+                changed = True
+        elif queries_raw not in (None, "", []):
+            changed = True
+
+        if isinstance(is_active_raw, bool):
+            if is_active != is_active_raw:
+                changed = True
+
+        cleaned.append(entry)
+        index[pid] = entry
+
+    for pid, name in brand_products.items():
+        name_clean = str(name).strip()
+        entry = index.get(pid)
+        if entry is None:
+            entry = {
+                "product.id": pid,
+                "product.name": name_clean,
+                "queries": [],
+                "is_active": True,
+            }
+            cleaned.append(entry)
+            index[pid] = entry
+            changed = True
+        else:
+            if entry.get("product.name") != name_clean:
+                entry["product.name"] = name_clean
+                changed = True
+
+    data["products"] = cleaned
+
+    if changed:
+        serialized = json.dumps(data, ensure_ascii=False, indent=2)
+        with suppress(OSError):
+            path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(serialized, encoding="utf-8")
+        logger.info("Обновлён файл продуктов: %s", path)
+    else:
+        logger.info("Файл продуктов актуален: %s", path)
+
+    return data
+
+
 def first_price_product_value(prod: Dict[str, Any]) -> Optional[int]:
     for s in (prod.get("sizes") or []):
         if not isinstance(s, dict):
@@ -319,7 +528,18 @@ def resolve_ui_price(prod: Dict[str, Any]) -> Optional[int]:
 
 
 def extract_item(prod: Dict[str, Any]) -> Dict[str, Any]:
+    def resolve_id() -> Optional[str]:
+        for key in ("id", "nmId", "nmid", "productId", "nm"):
+            raw = prod.get(key)
+            if raw is None:
+                continue
+            text = str(raw).strip()
+            if text:
+                return text
+        return None
+
     return {
+        "id": resolve_id(),
         "brand": prod.get("brand"),
         "name": prod.get("name"),
         "price_product": resolve_ui_price(prod),
@@ -416,18 +636,43 @@ def build_params(
     return remove_none(params)
 
 
+def parse_retry_after(headers: Any) -> float:
+    if not isinstance(headers, dict):
+        return 0.0
+    value = headers.get("Retry-After")
+    if value is None:
+        return 0.0
+    try:
+        delay = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return delay if delay > 0 else 0.0
+
+
 def attempt_with_client(client: Any, url: str, params: Dict[str, str], headers: Dict[str, str], timeout: float) -> Optional[Dict[str, Any]]:
     t0 = time.perf_counter()
     resp = client.get(url, params=params, headers=headers, timeout=timeout)
     elapsed = time.perf_counter() - t0
     logger.debug("GET %s", getattr(resp, "url", url))
+    status_code = getattr(resp, "status_code", "?")
     logger.info(
         " status=%s | %.3fs | bytes=%s",
-        getattr(resp, "status_code", "?"),
+        status_code,
         elapsed,
         len(getattr(resp, "content", b"")),
     )
     debug_log_full_response(resp, url)
+
+    if status_code == 429:
+        retry_delay = parse_retry_after(getattr(resp, "headers", {}))
+        random_delay = random.uniform(1.0, 5.0)
+        if retry_delay <= 0:
+            retry_delay = random_delay
+        else:
+            retry_delay = max(retry_delay, random_delay)
+        logger.warning("WB вернул 429 Too Many Requests. Пауза %.2fs перед повтором.", retry_delay)
+        time.sleep(retry_delay)
+        return None
 
     if hasattr(resp, "raise_for_status"):
         with suppress(Exception):
@@ -451,10 +696,10 @@ def fetch_page_best_effort(
     debug_dump_dir: Optional[Path],
     cookie_file: Optional[str],
     allow_flat_fallback: bool,
-) -> Tuple[List[Dict[str, Any]], str, Dict[str, Optional[str]]]:
+) -> Tuple[List[Dict[str, Any]], str, Dict[str, Optional[str]], List[Dict[str, Any]]]:
     """
     Try multiple client profiles to avoid the preset structure.
-    Returns: (items, mode, override)
+    Returns: (items, mode, override, raw_products)
       - items: list of extracted items
       - mode: {"ok", "fallback", "bad"}
       - override: server hints like dest/spp if present
@@ -548,7 +793,8 @@ def fetch_page_best_effort(
 
             # Normal structure — parse UI-like prices
             items = [extract_item(p) for p in products_raw]
-            return items, "ok", override
+            raw_list = [p for p in products_raw if isinstance(p, dict)]
+            return items, "ok", override, raw_list
 
         except requests.HTTPError as e:  # pragma: no cover - network branch
             code = e.response.status_code if getattr(e, "response", None) is not None else "?"
@@ -566,11 +812,12 @@ def fetch_page_best_effort(
     if allow_flat_fallback and isinstance(last_payload, dict):
         flat_list, _ = choose_products_list(last_payload)
         items = [extract_item(p) for p in flat_list]
+        raw_list = [p for p in flat_list if isinstance(p, dict)]
         logger.warning("Все профили дали preset (%s). Применён fallback по flat-ценам.", last_bad_reason or "no-reason")
-        return items, "fallback", last_override
+        return items, "fallback", last_override, raw_list
 
     logger.warning("Все профили дали preset. Fallback отключён — помечаем как Bad response.")
-    return [], "bad", last_override
+    return [], "bad", last_override, []
 
 
 # ============================
@@ -604,42 +851,38 @@ def save_csv_report(result: Dict[str, Any]) -> Path:
             q = block.get("query", "")
             products = block.get("products", []) or []
 
-            writer.writerow([q])  # query header
-            writer.writerow(["№", "brand", "name", "price_product", "price_rating"])  # added column
+            product_meta = block.get("product") or {}
+            header: List[str] = [str(q)]
+            pid = product_meta.get("id")
+            pname = product_meta.get("name")
+            if pid is not None:
+                header.append(f"product.id: {pid}")
+            if pname:
+                header.append(f"product.name: {pname}")
+            ref_price = block.get("reference_price")
+            if ref_price is not None:
+                header.append(f"reference_price: {format_price_rub(ref_price)}")
+            writer.writerow(header)
+
+            status = block.get("status")
+            if status:
+                writer.writerow([f"Статус: {status}"])
+
+            writer.writerow(["№", "id", "brand", "name", "price_product"])
 
             for i, p in enumerate(products, start=1):
                 price = format_price_rub(p.get("price_product"))
-                rating = p.get("price_rating")
-                writer.writerow([i, p.get("brand"), p.get("name"), price, rating if rating is not None else ""])  # noqa: E501
-
+                writer.writerow([
+                    i,
+                    p.get("id"),
+                    p.get("brand"),
+                    p.get("name"),
+                    price,
+                ])
             writer.writerow([])  # separator
 
     logger.info("CSV отчёт сохранён: %s", path)
     return path
-
-
-# ============================
-# Brand-based filtering helpers
-# ============================
-
-def compute_key_price(items: List[Dict[str, Any]], brand: str) -> Optional[int]:
-    """Pick reference price for key brand.
-    If multiple items of the brand exist, choose the minimal price_product.
-    Returns price in kopeks (int) or None if no suitable item found.
-    """
-    brand_lc = (brand or "").strip().lower()
-    candidates: List[int] = []
-    for it in items:
-        it_brand = str(it.get("brand") or "").strip().lower()
-        price = it.get("price_product")
-        if it_brand == brand_lc and isinstance(price, (int, float)):
-            try:
-                candidates.append(int(price))
-            except Exception:
-                pass
-    if not candidates:
-        return None
-    return min(candidates)
 
 
 def filter_by_price_diff(
@@ -666,48 +909,73 @@ def filter_by_price_diff(
     return [it for it in items if keep(it)]
 
 
-# ============================
-# Price rating (ranking) helpers
-# ============================
+def fetch_reference_price(
+    product_id: str,
+    *,
+    timeout: float,
+    dest: Optional[str],
+    debug_dump_dir: Optional[Path],
+    cookie_file: Optional[str],
+    limit: int = 40,
+    allow_flat_fallback: bool = True,
+) -> Tuple[Optional[int], Dict[str, Optional[str]], str]:
+    """Fetch reference price for a product via WB search."""
 
-def _dense_rank_by_price(items: List[Dict[str, Any]]) -> Dict[int, int]:
-    """Compute dense ranks by price_product across the given *final* list.
-    Returns mapping price(int)->rank (1 = cheapest). Equal prices share the same rank,
-    and the next distinct price gets the next consecutive rank (dense ranking).
-    """
-    prices: List[int] = []
-    for it in items:
-        v = it.get("price_product")
-        if isinstance(v, (int, float)):
-            try:
-                prices.append(int(v))
-            except Exception:
-                pass
-    uniq_sorted = sorted(set(prices))
-    return {price: i + 1 for i, price in enumerate(uniq_sorted)}
+    query = str(product_id).strip()
+    if not query:
+        return None, {}, "bad_id"
 
+    items, mode, override, raw_products = fetch_page_best_effort(
+        query=query,
+        page=1,
+        limit=limit,
+        timeout=timeout,
+        dest=dest,
+        debug_dump_dir=debug_dump_dir,
+        cookie_file=cookie_file,
+        allow_flat_fallback=allow_flat_fallback,
+    )
 
-def annotate_key_brand_price_ratings(items: List[Dict[str, Any]], key_brand: str) -> None:
-    """Annotate items in-place with 'price_rating' for key brand products only.
-    Does not change order. Works on the final list (after filtering & trimming).
-    """
-    rank_map = _dense_rank_by_price(items)
-    key = (key_brand or "").strip().lower()
-    for it in items:
-        brand = str(it.get("brand") or "").strip().lower()
-        if brand != key:
-            # ensure non-key products have no rating field or reset to None
-            it.pop("price_rating", None)
+    price: Optional[int] = None
+    # Try exact match on raw payload to avoid transformation issues.
+    for prod in raw_products:
+        if not isinstance(prod, dict):
             continue
-        v = it.get("price_product")
-        if isinstance(v, (int, float)):
+        pid = prod.get("id")
+        if pid is None:
+            continue
+        if str(pid) != query:
+            continue
+        val = resolve_ui_price(prod)
+        if isinstance(val, (int, float)):
             try:
-                it["price_rating"] = rank_map.get(int(v))
+                price = int(val)
             except Exception:
-                it["price_rating"] = None
-        else:
-            it["price_rating"] = None
+                price = None
+        break
 
+    if price is None:
+        for it in items:
+            pid = it.get("id")
+            if pid is None:
+                continue
+            if str(pid) != query:
+                continue
+            val = it.get("price_product")
+            if isinstance(val, (int, float)):
+                try:
+                    price = int(val)
+                except Exception:
+                    price = None
+            break
+
+    if price is None:
+        if mode == "bad":
+            logger.warning("Не удалось получить опорную цену для %s: Bad response", query)
+        else:
+            logger.warning("Не найдена опорная цена для product.id=%s", query)
+
+    return price, override, mode
 
 
 # ============================
@@ -724,10 +992,10 @@ def positive_int(value: str) -> int:
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="WB multi-search → CSV и (DEBUG) JSON")
     ap.add_argument(
-        "-q",
-        "--queries",
-        required=True,
-        help="Запросы через ';' (пример: 'монета крокодил гена; монета россия')",
+        "--products-file",
+        type=str,
+        default=DEFAULT_PRODUCTS_FILE,
+        help="Путь к products.json (создаётся и обновляется автоматически)",
     )
     ap.add_argument("--pages", type=positive_int, default=1, help="Сколько страниц брать (по умолчанию 1)")
     ap.add_argument("--limit", type=positive_int, default=20, help="Сколько товаров на страницу (до ~100)")
@@ -742,10 +1010,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--log-level", type=str, default="INFO", help="DEBUG | INFO | WARNING | ERROR")
     ap.add_argument("--debug-dump-dir", type=str, default=None, help="Папка для дампа сырого ответа при подозрениях")
     ap.add_argument("--cookie-file", type=str, default=None, help="Файл cookies (Netscape/Mozilla) для u-search/wildberries")
-    ap.add_argument("--no-flat-fallback", action="store_true", help="Отключить запасной парсинг по flat-ценам (salePriceU/priceU)")
+    ap.add_argument(
+        "--no-flat-fallback",
+        action="store_true",
+        help="Отключить запасной парсинг по flat-ценам (salePriceU/priceU)",
+    )
 
-    # Filtering overrides (script has defaults)
-    ap.add_argument("--key-brand", type=str, default=None, help="Переопределить ключевой бренд (иначе значение по умолчанию)")
     ap.add_argument(
         "--price-diff-pct",
         type=float,
@@ -762,104 +1032,175 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
 
     setup_logging(args.log_level)
 
-    # Script-embedded filter config + CLI overrides
     cfg = FilterConfig()
-    if isinstance(args.key_brand, str) and args.key_brand.strip():
-        cfg.key_brand = args.key_brand.strip()
     if isinstance(args.price_diff_pct, float):
         cfg.price_diff_pct = float(args.price_diff_pct)
 
     top_n = max(0, int(args.top))
-    queries = parse_queries(args.queries)
-    if not queries:
-        logger.error("Пустой список запросов.")
+    debug_dump_dir = Path(args.debug_dump_dir) if args.debug_dump_dir else None
+
+    products_path = Path(args.products_file)
+
+    try:
+        session = make_requests_session(args.cookie_file)
+    except Exception as exc:  # pragma: no cover - defensive branch
+        logger.error("Не удалось создать HTTP-сессию: %s", exc)
+        sys.exit(1)
+
+    try:
+        products_data = ensure_products_file(products_path, session=session)
+    except Exception as exc:
+        logger.error("Не удалось обновить файл продуктов '%s': %s", products_path, exc)
+        sys.exit(1)
+    finally:
+        with suppress(Exception):
+            session.close()
+
+    products_list = [p for p in products_data.get("products", []) if isinstance(p, dict)]
+
+    missing_queries = [
+        p for p in products_list if p.get("is_active", True) and not sanitize_query_list(p.get("queries"))
+    ]
+    if missing_queries:
+        names = "; ".join(
+            str(p.get("product.name") or p.get("product.id") or "<без названия>") for p in missing_queries
+        )
+        message = (
+            "Для следующих продуктов: "
+            f"{names} необходимо заполнить поисковые запросы(queries). Или отключить их из работы скрипта (is_active = false)"
+        )
+        print(message)
+        logger.error(message)
         sys.exit(2)
 
-    debug_dump_dir = Path(args.debug_dump_dir) if args.debug_dump_dir else None
+    active_products = [p for p in products_list if p.get("is_active", True)]
+    if not active_products:
+        logger.warning("Нет активных продуктов в %s", products_path)
+        return
+
+    total_queries = sum(len(sanitize_query_list(p.get("queries"))) for p in active_products)
+    if total_queries == 0:
+        logger.warning("У активных продуктов нет поисковых запросов в %s", products_path)
+        return
 
     result: Dict[str, Any] = {"queries": []}
     t0 = time.perf_counter()
 
-    # Track server-provided dest (if it changes mid-run)
     current_dest: Optional[str] = args.dest
 
-    for qi, q in enumerate(queries, 1):
-        logger.info("===== Query %s/%s: '%s' =====", qi, len(queries), q)
-        acc: List[Dict[str, Any]] = []
-        query_status: str = "ok"
+    for product in active_products:
+        product_id = str(product.get("product.id") or "").strip()
+        product_name = str(product.get("product.name") or "").strip()
+        queries = sanitize_query_list(product.get("queries"))
 
-        for page in range(1, args.pages + 1):
-            items, mode, override = fetch_page_best_effort(
-                query=q,
-                page=page,
-                limit=args.limit,
-                timeout=args.timeout,
-                dest=current_dest,
-                debug_dump_dir=debug_dump_dir,
-                cookie_file=args.cookie_file,
-                allow_flat_fallback=not args.no_flat_fallback,
-            )
+        if not product_id:
+            logger.warning("Пропущен продукт без корректного product.id")
+            continue
 
-            # If server hinted its own dest — switch to it for subsequent requests
-            if override.get("dest") and override["dest"] != (current_dest or ""):
-                logger.info(" Переключаем dest на серверный: %s → %s", current_dest, override["dest"])
-                current_dest = override["dest"]
+        logger.info("===== Товар: %s (product.id=%s) =====", product_name or "<без названия>", product_id)
 
-            if mode == "bad":
-                query_status = "Bad response"
-                break
-            elif mode == "fallback" and query_status == "ok":
-                query_status = "Fallback(flat)"
+        ref_price, override, ref_mode = fetch_reference_price(
+            product_id,
+            timeout=args.timeout,
+            dest=current_dest,
+            debug_dump_dir=debug_dump_dir,
+            cookie_file=args.cookie_file,
+            allow_flat_fallback=not args.no_flat_fallback,
+        )
 
-            if items:
-                # IMPORTANT: preserve page order — extend as-is
-                acc.extend(items)
+        if override.get("dest") and override["dest"] != (current_dest or ""):
+            logger.info(" Переключаем dest на серверный (reference): %s → %s", current_dest, override["dest"])
+            current_dest = override["dest"]
+
+        if ref_mode == "fallback":
+            logger.info(" Опорная цена получена через flat-fallback")
+
+        for qi, q in enumerate(queries, 1):
+            logger.info("--- Запрос %s/%s: '%s' ---", qi, len(queries), q)
+
+            acc: List[Dict[str, Any]] = []
+            query_status: str = "ok"
+
+            for page in range(1, args.pages + 1):
+                items, mode, override, _ = fetch_page_best_effort(
+                    query=q,
+                    page=page,
+                    limit=args.limit,
+                    timeout=args.timeout,
+                    dest=current_dest,
+                    debug_dump_dir=debug_dump_dir,
+                    cookie_file=args.cookie_file,
+                    allow_flat_fallback=not args.no_flat_fallback,
+                )
+
+                if override.get("dest") and override["dest"] != (current_dest or ""):
+                    logger.info(" Переключаем dest на серверный: %s → %s", current_dest, override["dest"])
+                    current_dest = override["dest"]
+
+                if mode == "bad":
+                    query_status = "Bad response"
+                    break
+                elif mode == "fallback" and query_status == "ok":
+                    query_status = "Fallback(flat)"
+
+                if items:
+                    acc.extend(items)
+                else:
+                    logger.debug(" Пустая страница или ошибка.")
+
+                if len(acc) >= top_n:
+                    logger.info(
+                        " Достигнут лимит --top=%s, ранняя остановка по '%s' на page=%s",
+                        top_n,
+                        q,
+                        page,
+                    )
+                    break
+
+                if page < args.pages and args.delay > 0:
+                    time.sleep(args.delay + random.uniform(0, args.delay / 2))
+
+            logger.info("Собрано по '%s': %s товаров (до фильтрации)", q, len(acc))
+
+            if ref_price is not None:
+                before = len(acc)
+                acc = filter_by_price_diff(acc, ref_price, cfg.price_diff_pct)
+                after = len(acc)
+                logger.info(
+                    "Фильтрация: product.id=%s, порог=%.2f%%, опорная цена=%s → осталось %s из %s",
+                    product_id,
+                    cfg.price_diff_pct,
+                    format_price_rub(ref_price),
+                    after,
+                    before,
+                )
             else:
-                logger.debug(" Пустая страница или ошибка.")
+                logger.info(
+                    "Фильтрация пропущена: нет опорной цены для product.id=%s",
+                    product_id,
+                )
 
-            if len(acc) >= top_n:
-                logger.info(" Достигнут лимит --top=%s, ранняя остановка по '%s' на page=%s", top_n, q, page)
-                break
+            trimmed = acc[:top_n]
+            if len(acc) > len(trimmed):
+                logger.info("Обрезаем до первых %s элементов.", len(trimmed))
 
-            if page < args.pages and args.delay > 0:
-                time.sleep(args.delay + random.uniform(0, args.delay / 2))
+            entry: Dict[str, Any] = {
+                "query": q,
+                "products": trimmed,
+                "product": {"id": product_id, "name": product_name},
+            }
+            if ref_price is not None:
+                entry["reference_price"] = ref_price
+            if query_status != "ok":
+                entry["status"] = query_status
 
-        logger.info("Собрано по '%s': %s товаров (до фильтрации)", q, len(acc))
+            result["queries"].append(entry)
 
-        # ===== Brand-based price filtering (order-preserving) =====
-        ref_price = compute_key_price(acc, cfg.key_brand)
-        if ref_price is not None:
-            before = len(acc)
-            acc = filter_by_price_diff(acc, ref_price, cfg.price_diff_pct)
-            after = len(acc)
-            logger.info(
-                "Фильтрация: бренд='%s', порог=%.2f%%, опорная цена=%s → осталось %s из %s",
-                cfg.key_brand,
-                cfg.price_diff_pct,
-                format_price_rub(ref_price),
-                after,
-                before,
-            )
-        else:
-            logger.info(
-                "Фильтрация пропущена: не найден ключевой бренд '%s' в результатах.",
-                cfg.key_brand,
-            )
-
-        # ===== Trim after filtering =====
-        trimmed = acc[:top_n]
-        if len(acc) > len(trimmed):
-            logger.info("Обрезаем до первых %s элементов.", len(trimmed))
-
-        # ===== Price rating for key brand (on final list) =====
-        annotate_key_brand_price_ratings(trimmed, cfg.key_brand)
-
-        entry: Dict[str, Any] = {"query": q, "products": trimmed}
-        if query_status != "ok":
-            entry["status"] = query_status  # e.g., Fallback(flat) | Bad response
-        result["queries"].append(entry)
-
-    logger.info("Готово. Всего страниц max: %s. Время: %.3fs", len(queries) * args.pages, time.perf_counter() - t0)
+    logger.info(
+        "Готово. Запросов: %s. Время: %.3fs",
+        total_queries,
+        time.perf_counter() - t0,
+    )
 
     out_json = json.dumps(result, ensure_ascii=False, indent=2 if args.pretty else None)
     logger.debug("FINAL JSON RESULT: %s", out_json)
@@ -871,7 +1212,6 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         except OSError as e:  # pragma: no cover - IO branch
             logger.error("Не удалось сохранить '%s': %s", args.output, e)
 
-    # CSV report
     save_csv_report(result)
 
 
