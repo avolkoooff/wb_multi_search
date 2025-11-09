@@ -85,6 +85,7 @@ UA_TPL = (
 # Anti-preset strategy knobs
 VARIANT_BUDGET = 10  # how many profiles to attempt per page
 RETRY_JITTER = 1.0  # base sleep (sec) between suspicious responses
+BRAND_MAX_RETRIES = 5  # attempts for brand catalog fetch (429-aware)
 
 
 # ============================
@@ -341,9 +342,39 @@ def fetch_brand_catalog_products(
         own_session = True
 
     try:
-        resp = sess.get(BRAND_URL, params=query_params, headers=make_headers(), timeout=timeout)
-        logger.info("GET %s", getattr(resp, "url", BRAND_URL))
-        resp.raise_for_status()
+        attempt = 0
+        while True:
+            attempt += 1
+            resp = sess.get(
+                BRAND_URL,
+                params=query_params,
+                headers=make_headers(),
+                timeout=timeout,
+            )
+            logger.info("GET %s", getattr(resp, "url", BRAND_URL))
+
+            status_code = getattr(resp, "status_code", None)
+            if status_code == 429:
+                if attempt >= BRAND_MAX_RETRIES:
+                    logger.error(
+                        "Каталог бренда: превышено число попыток после 429 Too Many Requests"
+                    )
+                    resp.raise_for_status()
+                retry_delay = parse_retry_after(getattr(resp, "headers", {}))
+                random_delay = random.uniform(1.0, 5.0)
+                if retry_delay <= 0:
+                    retry_delay = random_delay
+                else:
+                    retry_delay = max(retry_delay, random_delay)
+                logger.warning(
+                    "Каталог бренда вернул 429 Too Many Requests. Пауза %.2fs перед повтором.",
+                    retry_delay,
+                )
+                time.sleep(retry_delay)
+                continue
+
+            resp.raise_for_status()
+            break
         try:
             payload = resp.json()
         except Exception as exc:  # pragma: no cover - defensive branch
