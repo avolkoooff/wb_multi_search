@@ -264,6 +264,13 @@ def load_cookie_jar_from_file(cookie_file: str) -> Tuple[Optional[CookieJar], Op
     netscape_error: Optional[Exception] = None
     try:
         jar.load(cookie_file, ignore_discard=True, ignore_expires=True)
+        count = len(jar)
+        logger.info(
+            "Загружено %d cookie(s) из файла '%s' (формат: %s)",
+            count,
+            cookie_file,
+            "netscape",
+        )
         return jar, "netscape", None
     except Exception as exc:
         netscape_error = exc
@@ -287,6 +294,12 @@ def load_cookie_jar_from_file(cookie_file: str) -> Tuple[Optional[CookieJar], Op
         count += 1
 
     if count:
+        logger.info(
+            "Загружено %d cookie(s) из файла '%s' (формат: %s)",
+            count,
+            cookie_file,
+            "json",
+        )
         return jar_json, "json", None
 
     msg = "JSON cookie file does not contain name/value pairs"
