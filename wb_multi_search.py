@@ -28,7 +28,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote_plus
 
 import requests
-from http.cookiejar import MozillaCookieJar
+from http.cookiejar import CookieJar, MozillaCookieJar
+from requests.cookies import RequestsCookieJar, create_cookie
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -162,6 +163,138 @@ def make_headers(
     return h
 
 
+def _coerce_to_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y"}:
+            return True
+        if normalized in {"0", "false", "no", "n"}:
+            return False
+    return None
+
+
+def _coerce_to_str(value: Any, *, allow_empty: bool = False) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        result = value
+    else:
+        result = str(value)
+    if not allow_empty and result == "":
+        return None
+    return result
+
+
+def _iter_json_cookie_entries(data: Any) -> Iterable[Dict[str, Any]]:
+    if isinstance(data, list):
+        for item in data:
+            yield from _iter_json_cookie_entries(item)
+        return
+
+    if isinstance(data, dict):
+        if "name" in data and "value" in data:
+            yield data
+            return
+
+        for key in ("cookies", "Cookies", "items", "Items", "entries", "Entries"):
+            nested = data.get(key)
+            if isinstance(nested, (list, dict)):
+                yield from _iter_json_cookie_entries(nested)
+
+        for value in data.values():
+            if isinstance(value, (list, dict)):
+                yield from _iter_json_cookie_entries(value)
+
+
+def _cookie_from_json(entry: Dict[str, Any]):
+    name = _coerce_to_str(entry.get("name") or entry.get("Name"))
+    value = _coerce_to_str(entry.get("value") or entry.get("Value"), allow_empty=True)
+    if name is None or value is None:
+        return None
+
+    domain = _coerce_to_str(entry.get("domain") or entry.get("Domain"))
+    if domain == "":
+        domain = None
+    path = _coerce_to_str(entry.get("path") or entry.get("Path")) or "/"
+
+    expires_raw = (
+        entry.get("expires")
+        or entry.get("expiry")
+        or entry.get("expirationDate")
+        or entry.get("ExpirationDate")
+    )
+    expires: Optional[int]
+    if expires_raw is None:
+        expires = None
+    else:
+        try:
+            expires = int(float(expires_raw))
+        except (TypeError, ValueError):
+            expires = None
+
+    secure_val = _coerce_to_bool(entry.get("secure") or entry.get("Secure"))
+    http_only_val = _coerce_to_bool(entry.get("httpOnly") or entry.get("HttpOnly"))
+    same_site = _coerce_to_str(entry.get("sameSite") or entry.get("SameSite"))
+
+    rest: Dict[str, Any] = {}
+    if http_only_val:
+        rest["HttpOnly"] = True
+    if same_site:
+        rest["SameSite"] = same_site
+
+    kwargs: Dict[str, Any] = {"path": path}
+    if domain:
+        kwargs["domain"] = domain
+    if expires is not None:
+        kwargs["expires"] = expires
+    if secure_val is not None:
+        kwargs["secure"] = secure_val
+    if rest:
+        kwargs["rest"] = rest
+
+    return create_cookie(name=name, value=value, **kwargs)
+
+
+def load_cookie_jar_from_file(cookie_file: str) -> Tuple[Optional[CookieJar], Optional[str], Optional[str]]:
+    jar = MozillaCookieJar()
+    netscape_error: Optional[Exception] = None
+    try:
+        jar.load(cookie_file, ignore_discard=True, ignore_expires=True)
+        return jar, "netscape", None
+    except Exception as exc:
+        netscape_error = exc
+
+    try:
+        raw = Path(cookie_file).read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except Exception as exc:
+        msg = f"JSON decode error: {exc}"
+        if netscape_error:
+            msg = f"Netscape load error: {netscape_error}; {msg}"
+        return None, None, msg
+
+    jar_json = RequestsCookieJar()
+    count = 0
+    for entry in _iter_json_cookie_entries(data):
+        cookie = _cookie_from_json(entry)
+        if cookie is None:
+            continue
+        jar_json.set_cookie(cookie)
+        count += 1
+
+    if count:
+        return jar_json, "json", None
+
+    msg = "JSON cookie file does not contain name/value pairs"
+    if netscape_error:
+        msg = f"Netscape load error: {netscape_error}; {msg}"
+    return None, None, msg
+
+
 def make_requests_session(cookie_file: Optional[str] = None) -> requests.Session:
     s = requests.Session()
     retries = Retry(
@@ -175,13 +308,16 @@ def make_requests_session(cookie_file: Optional[str] = None) -> requests.Session
     s.trust_env = False
 
     if cookie_file:
-        jar = MozillaCookieJar()
-        try:
-            jar.load(cookie_file, ignore_discard=True, ignore_expires=True)
+        jar, source, error = load_cookie_jar_from_file(cookie_file)
+        if jar is not None:
             s.cookies = jar
-            logger.info("Используются cookies (requests) из файла: %s", cookie_file)
-        except Exception as e:  # pragma: no cover - IO branch
-            logger.warning("Не удалось загрузить cookies '%s' для requests: %s", cookie_file, e)
+            logger.info(
+                "Используются cookies (%s, requests) из файла: %s",
+                source,
+                cookie_file,
+            )
+        elif error:
+            logger.warning("Не удалось загрузить cookies '%s' для requests: %s", cookie_file, error)
 
     return s
 
@@ -192,19 +328,21 @@ def make_httpx_client(cookie_file: Optional[str] = None, http2: bool = True):
 
     cookies = None
     if cookie_file:
-        # Transfer cookies from MozillaCookieJar to httpx.Cookies
-        cj = MozillaCookieJar()
-        try:
-            cj.load(cookie_file, ignore_discard=True, ignore_expires=True)
+        jar, source, error = load_cookie_jar_from_file(cookie_file)
+        if jar is not None:
             cookies = httpx.Cookies()
-            for c in cj:
+            for c in jar:
                 try:
-                    cookies.set(c.name, c.value, domain=c.domain, path=c.path or "/")
+                    cookies.set(c.name, c.value, domain=c.domain or None, path=c.path or "/")
                 except Exception:
                     cookies.set(c.name, c.value)
-            logger.info("Используются cookies (httpx) из файла: %s", cookie_file)
-        except Exception as e:  # pragma: no cover - IO branch
-            logger.warning("Не удалось загрузить cookies '%s' для httpx: %s", cookie_file, e)
+            logger.info(
+                "Используются cookies (%s, httpx) из файла: %s",
+                source,
+                cookie_file,
+            )
+        elif error:
+            logger.warning("Не удалось загрузить cookies '%s' для httpx: %s", cookie_file, error)
 
     return httpx.Client(http2=http2, cookies=cookies, timeout=None, trust_env=False)
 
@@ -1061,7 +1199,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--output", type=str, default=None, help="Куда сохранить JSON (опционально)")
     ap.add_argument("--log-level", type=str, default="INFO", help="DEBUG | INFO | WARNING | ERROR")
     ap.add_argument("--debug-dump-dir", type=str, default=None, help="Папка для дампа сырого ответа при подозрениях")
-    ap.add_argument("--cookie-file", type=str, default=None, help="Файл cookies (Netscape/Mozilla) для u-search/wildberries")
+    ap.add_argument(
+        "--cookie-file",
+        type=str,
+        default=None,
+        help="Файл cookies (Netscape/Mozilla или JSON) для u-search/wildberries",
+    )
     ap.add_argument(
         "--no-flat-fallback",
         action="store_true",
